@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from typing import Any
 
 from tools.environments import (
@@ -24,8 +25,16 @@ def _missing_required_env() -> list[str]:
 
 
 def coder_backend_available() -> bool:
-    """Return whether mandatory Coder connection configuration is present."""
+    """Return whether mandatory Coder connection environment is present."""
     return not _missing_required_env()
+
+
+def coder_backend_config_available(config: Mapping[str, Any]) -> bool:
+    """Return whether merged environment/profile config can construct Coder."""
+    return all(
+        isinstance(config.get(name), str) and bool(config[name].strip())
+        for name in ("base_url", "api_key", "workspace_name")
+    )
 
 
 def _parse_forward_env() -> list[str]:
@@ -58,18 +67,30 @@ def _parse_startup_timeout() -> int:
     return value
 
 
-def resolve_coder_config() -> dict[str, Any]:
-    """Resolve Coder-specific environment config before factory invocation."""
-    missing = _missing_required_env()
-    if missing:
-        raise ValueError("Coder backend requires " + ", ".join(missing))
-    return {
-        "base_url": os.environ["CODER_URL"],
-        "api_key": os.environ["CODER_API_KEY"],
-        "workspace_name": os.environ["CODER_WORKSPACE"],
-        "forward_env": _parse_forward_env(),
-        "workspace_startup_timeout": _parse_startup_timeout(),
+def resolve_coder_config(
+    raw_backend_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve Coder config with environment > profile YAML > defaults."""
+    config: dict[str, Any] = {
+        "forward_env": [],
+        "workspace_startup_timeout": 180,
     }
+    config.update(raw_backend_config)
+
+    for config_key, env_name in (
+        ("base_url", "CODER_URL"),
+        ("api_key", "CODER_API_KEY"),
+        ("workspace_name", "CODER_WORKSPACE"),
+    ):
+        value = os.getenv(env_name)
+        if value is not None:
+            config[config_key] = value
+
+    if os.getenv("TERMINAL_CODER_FORWARD_ENV") is not None:
+        config["forward_env"] = _parse_forward_env()
+    if os.getenv("TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT") is not None:
+        config["workspace_startup_timeout"] = _parse_startup_timeout()
+    return config
 
 
 def _remote_cwd(request: BackendFactoryRequest) -> str:
@@ -128,6 +149,7 @@ def coder_backend_definition() -> BackendDefinition:
         default_cwd="~",
         factory=create_coder_environment,
         availability_check=coder_backend_available,
+        config_availability_check=coder_backend_config_available,
         capabilities=BackendCapabilities(
             execution_location=ExecutionLocation.REMOTE,
             filesystem_semantics=FilesystemSemantics.ISOLATED,
@@ -174,8 +196,8 @@ def coder_backend_definition() -> BackendDefinition:
         },
         config_resolver=resolve_coder_config,
         install_hint=(
-            "Set CODER_URL, CODER_API_KEY, and CODER_WORKSPACE in the active "
-            "Hermes profile environment."
+            "Set terminal.backends.coder.base_url and workspace_name in the active "
+            "profile config, and set CODER_API_KEY in its environment."
         ),
         diagnostic_metadata={"transport": "coder-rest-pty"},
     )

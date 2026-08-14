@@ -95,6 +95,58 @@ def test_coder_availability_requires_all_connection_environment(monkeypatch):
     assert definition.is_available() is True
 
 
+def test_coder_availability_accepts_merged_profile_and_secret_config(monkeypatch):
+    from hermes_plugin_coder.plugin import coder_backend_definition
+
+    for name in _REQUIRED_ENV:
+        monkeypatch.delenv(name, raising=False)
+    definition = coder_backend_definition()
+
+    assert definition.is_available(
+        {
+            "base_url": "https://coder.example",
+            "api_key": "secret-token",
+            "workspace_name": "shared-dev",
+        }
+    ) is True
+    assert definition.is_available(
+        {
+            "base_url": "https://coder.example",
+            "workspace_name": "shared-dev",
+        }
+    ) is False
+
+
+def test_manager_resolves_profile_yaml_with_environment_secret(monkeypatch):
+    from hermes_plugin_coder.plugin import coder_backend_definition
+    from tools.environments.manager import EnvironmentManager
+    from tools.environments.registry import TerminalBackendRegistry
+
+    monkeypatch.delenv("CODER_URL", raising=False)
+    monkeypatch.delenv("CODER_WORKSPACE", raising=False)
+    monkeypatch.delenv("TERMINAL_CODER_FORWARD_ENV", raising=False)
+    monkeypatch.delenv("TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT", raising=False)
+    monkeypatch.setenv("CODER_API_KEY", "secret-token")
+    registry = TerminalBackendRegistry()
+    definition = registry.register(coder_backend_definition())
+    manager = EnvironmentManager(registry)
+    raw_config = {
+        "base_url": "https://coder.example",
+        "workspace_name": "shared-dev",
+        "forward_env": ["GITHUB_TOKEN"],
+        "workspace_startup_timeout": 500,
+    }
+
+    assert manager.resolve_backend("coder", backend_config=raw_config) is definition
+    assert manager.resolve_backend_config(definition, raw_config) == {
+        "base_url": "https://coder.example",
+        "api_key": "secret-token",
+        "workspace_name": "shared-dev",
+        "forward_env": ["GITHUB_TOKEN"],
+        "workspace_startup_timeout": 500,
+    }
+
+
 def test_factory_builds_coder_environment_from_backend_config_and_host_request(
     monkeypatch,
 ):
@@ -161,30 +213,90 @@ def test_factory_defaults_generated_root_cwd_to_remote_home(monkeypatch):
     assert constructor.call_args.kwargs["cwd"] == "~"
 
 
-def test_config_resolver_parses_plugin_environment(monkeypatch):
+def test_config_resolver_uses_environment_over_yaml_over_defaults(monkeypatch):
     from hermes_plugin_coder.plugin import resolve_coder_config
 
     _set_required_env(monkeypatch)
-    monkeypatch.setenv("TERMINAL_CODER_FORWARD_ENV", '["GITHUB_TOKEN", "CUSTOM_VALUE"]')
+    monkeypatch.setenv("TERMINAL_CODER_FORWARD_ENV", '["ENV_TOKEN"]')
     monkeypatch.setenv("TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT", "240")
 
-    assert resolve_coder_config() == {
+    assert resolve_coder_config(
+        {
+            "base_url": "https://yaml.example",
+            "api_key": "yaml-token",
+            "workspace_name": "yaml-workspace",
+            "forward_env": ["YAML_TOKEN"],
+            "workspace_startup_timeout": 500,
+        }
+    ) == {
         "base_url": "https://coder.example",
         "api_key": "secret-token",
         "workspace_name": "shared-dev",
-        "forward_env": ["GITHUB_TOKEN", "CUSTOM_VALUE"],
+        "forward_env": ["ENV_TOKEN"],
         "workspace_startup_timeout": 240,
     }
 
 
-def test_config_resolver_rejects_invalid_forward_env_json(monkeypatch):
+def test_config_resolver_uses_yaml_over_defaults_when_environment_absent(monkeypatch):
     from hermes_plugin_coder.plugin import resolve_coder_config
 
-    _set_required_env(monkeypatch)
+    for name in (
+        *_REQUIRED_ENV,
+        "TERMINAL_CODER_FORWARD_ENV",
+        "TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert resolve_coder_config(
+        {
+            "base_url": "https://yaml.example",
+            "api_key": "yaml-token",
+            "workspace_name": "yaml-workspace",
+            "forward_env": ["YAML_TOKEN"],
+            "workspace_startup_timeout": 500,
+        }
+    ) == {
+        "base_url": "https://yaml.example",
+        "api_key": "yaml-token",
+        "workspace_name": "yaml-workspace",
+        "forward_env": ["YAML_TOKEN"],
+        "workspace_startup_timeout": 500,
+    }
+
+
+def test_config_resolver_supplies_runtime_defaults(monkeypatch):
+    from hermes_plugin_coder.plugin import resolve_coder_config
+
+    for name in (
+        *_REQUIRED_ENV,
+        "TERMINAL_CODER_FORWARD_ENV",
+        "TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert resolve_coder_config({}) == {
+        "forward_env": [],
+        "workspace_startup_timeout": 180,
+    }
+
+
+def test_config_resolver_preserves_explicit_empty_environment_override(monkeypatch):
+    from hermes_plugin_coder.plugin import resolve_coder_config
+
+    monkeypatch.setenv("CODER_URL", "")
+
+    assert resolve_coder_config({"base_url": "https://yaml.example"})[
+        "base_url"
+    ] == ""
+
+
+def test_config_resolver_rejects_invalid_environment_override(monkeypatch):
+    from hermes_plugin_coder.plugin import resolve_coder_config
+
     monkeypatch.setenv("TERMINAL_CODER_FORWARD_ENV", "not-json")
 
     with pytest.raises(ValueError, match="TERMINAL_CODER_FORWARD_ENV"):
-        resolve_coder_config()
+        resolve_coder_config({"forward_env": ["YAML_TOKEN"]})
 
 
 def test_factory_rejects_missing_required_backend_config():

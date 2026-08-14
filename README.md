@@ -10,23 +10,37 @@ Third-party [Coder](https://coder.com/) terminal backend for Hermes Agent's expe
 
 ## Configuration
 
-Set these values in the active Hermes profile's `.env` (normally `~/.hermes/.env`):
+Select Coder and store its non-secret settings in the active Hermes profile config:
+
+```yaml
+terminal:
+  backend: coder
+  backends:
+    coder:
+      base_url: https://coder.example.com
+      workspace_name: my-workspace
+      forward_env:
+        - GITHUB_TOKEN
+      workspace_startup_timeout: 180
+```
+
+Keep the Coder API key in the active profile's `.env`:
 
 ```dotenv
 EXP_BACKEND=1
-TERMINAL_ENV=coder
-CODER_URL=https://coder.example.com
 CODER_API_KEY=...
-CODER_WORKSPACE=my-workspace
 ```
 
-Optional values:
+Every schema field can also be overridden through its declared environment variable:
 
 ```dotenv
-TERMINAL_CWD=~
+CODER_URL=https://coder.example.com
+CODER_WORKSPACE=my-workspace
 TERMINAL_CODER_FORWARD_ENV=["GITHUB_TOKEN"]
 TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT=180
 ```
+
+Runtime precedence is environment variable, then profile YAML, then the backend default. An explicitly set but invalid or empty environment override fails closed instead of falling back to YAML.
 
 `CODER_API_KEY` is used only for Coder REST and PTY WebSocket authentication. It is not included in backend diagnostic metadata.
 
