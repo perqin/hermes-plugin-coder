@@ -141,24 +141,33 @@ def coder_backend_definition() -> BackendDefinition:
             supports_persistence=True,
         ),
         config_schema={
-            "base_url": {"type": "string", "env": "CODER_URL", "required": True},
+            "base_url": {
+                "type": "string",
+                "description": "Coder deployment URL",
+                "env": "CODER_URL",
+                "required": True,
+            },
             "api_key": {
                 "type": "secret",
+                "description": "Coder API key",
                 "env": "CODER_API_KEY",
                 "required": True,
             },
             "workspace_name": {
                 "type": "string",
+                "description": "Coder workspace name",
                 "env": "CODER_WORKSPACE",
                 "required": True,
             },
             "forward_env": {
-                "type": "json-list",
+                "type": "list",
+                "description": "Environment variables forwarded to the workspace",
                 "env": "TERMINAL_CODER_FORWARD_ENV",
                 "default": [],
             },
             "workspace_startup_timeout": {
-                "type": "integer",
+                "type": "number",
+                "description": "Workspace startup timeout in seconds",
                 "env": "TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT",
                 "default": 180,
             },

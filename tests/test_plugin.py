@@ -43,6 +43,45 @@ def test_register_adds_coder_backend_definition(monkeypatch):
     assert callable(definition.config_resolver)
 
 
+def test_coder_config_schema_uses_dashboard_contract_types():
+    from hermes_plugin_coder.plugin import coder_backend_definition
+
+    schema = coder_backend_definition().validated_config_schema()
+
+    assert schema == {
+        "base_url": {
+            "type": "string",
+            "description": "Coder deployment URL",
+            "env": "CODER_URL",
+            "required": True,
+        },
+        "api_key": {
+            "type": "secret",
+            "description": "Coder API key",
+            "env": "CODER_API_KEY",
+            "required": True,
+        },
+        "workspace_name": {
+            "type": "string",
+            "description": "Coder workspace name",
+            "env": "CODER_WORKSPACE",
+            "required": True,
+        },
+        "forward_env": {
+            "type": "list",
+            "description": "Environment variables forwarded to the workspace",
+            "env": "TERMINAL_CODER_FORWARD_ENV",
+            "default": [],
+        },
+        "workspace_startup_timeout": {
+            "type": "number",
+            "description": "Workspace startup timeout in seconds",
+            "env": "TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT",
+            "default": 180,
+        },
+    }
+
+
 def test_coder_availability_requires_all_connection_environment(monkeypatch):
     from hermes_plugin_coder.plugin import coder_backend_definition
 

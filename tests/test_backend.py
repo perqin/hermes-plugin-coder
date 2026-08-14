@@ -220,7 +220,13 @@ def test_coder_environment_initializes_session_snapshot_without_recursive_execut
     followup_query = parse_qs(urlparse(connect_urls[1]).query)
     followup_command = followup_query["command"][0]
     assert f"source {env._snapshot_path}" in followup_command
-    assert f"export -p > {env._snapshot_path}" in followup_command
+    assert f"mktemp {env._snapshot_path}.tmp.XXXXXXXXXX" in followup_command
+    assert "export -p;" in followup_command
+    assert (
+        f'}} > "$__hermes_snap_tmp" && mv -f "$__hermes_snap_tmp" '
+        f'{env._snapshot_path}; }} 2>/dev/null || rm -f "$__hermes_snap_tmp"'
+        in followup_command
+    )
     assert "printf $HERMES_CODER_SNAPSHOT_TEST" in followup_command
 
 
