@@ -1,40 +1,48 @@
-"""Registration and factory adapter for the Coder terminal backend."""
+"""Terminal-environment provider adapter for the Coder backend."""
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Mapping
 from typing import Any
 
-from tools.environments import (
-    BackendCapabilities,
-    BackendDefinition,
-    BackendFactoryRequest,
-    ExecutionLocation,
-    FilesystemSemantics,
+from agent.terminal_env_provider import TerminalEnvironmentProvider
+
+from .backend import (
+    CoderEnvironment,
+    _normalize_coder_base_url,
+    _normalize_coder_workspace_name,
+    _validate_coder_api_key,
+    _validate_coder_forward_env,
+    _validate_coder_startup_timeout,
 )
 
-from .backend import CoderEnvironment
-
-_REQUIRED_ENV = ("CODER_URL", "CODER_API_KEY", "CODER_WORKSPACE")
+logger = logging.getLogger(__name__)
 
 
-def _missing_required_env() -> list[str]:
-    return [name for name in _REQUIRED_ENV if not (os.getenv(name) or "").strip()]
-
-
-def coder_backend_available() -> bool:
-    """Return whether mandatory Coder connection environment is present."""
-    return not _missing_required_env()
+def _invalid_config_fields(config: Mapping[str, Any]) -> list[str]:
+    """Return safe field names whose values the factory would reject."""
+    invalid: list[str] = []
+    defaults = {"forward_env": [], "workspace_startup_timeout": 180}
+    for field, validator in (
+        ("base_url", _normalize_coder_base_url),
+        ("api_key", _validate_coder_api_key),
+        ("workspace_name", _normalize_coder_workspace_name),
+        ("forward_env", _validate_coder_forward_env),
+        ("workspace_startup_timeout", _validate_coder_startup_timeout),
+    ):
+        try:
+            validator(config.get(field, defaults.get(field)))
+        except ValueError:
+            invalid.append(field)
+    return invalid
 
 
 def coder_backend_config_available(config: Mapping[str, Any]) -> bool:
-    """Return whether merged environment/profile config can construct Coder."""
-    return all(
-        isinstance(config.get(name), str) and bool(config[name].strip())
-        for name in ("base_url", "api_key", "workspace_name")
-    )
+    """Return whether resolved config can construct a Coder environment."""
+    return not _invalid_config_fields(config)
 
 
 def _parse_forward_env() -> list[str]:
@@ -93,76 +101,59 @@ def resolve_coder_config(
     return config
 
 
-def _remote_cwd(request: BackendFactoryRequest) -> str:
-    if request.cwd in {"", "/root"}:
+def _remote_cwd(cwd: str) -> str:
+    if cwd in {"", "/root"}:
         return "~"
-    return request.cwd
+    return cwd
 
 
-def create_coder_environment(request: BackendFactoryRequest) -> CoderEnvironment:
-    """Build one Coder environment from host-owned and backend-specific config."""
-    config = request.backend_config
-    required = ("base_url", "api_key", "workspace_name")
-    invalid = [
-        name
-        for name in required
-        if not isinstance(config.get(name), str) or not config[name].strip()
-    ]
+def create_coder_environment(
+    *,
+    cwd: str,
+    timeout: int,
+    task_id: str = "default",
+    backend_config: Mapping[str, Any] | None = None,
+    **_kwargs: Any,
+) -> CoderEnvironment:
+    """Build one Coder environment from host and resolved provider config."""
+    config = dict(backend_config or {})
+    invalid = _invalid_config_fields(config)
     if invalid:
         raise ValueError(
-            "Coder backend config requires non-empty strings for " + ", ".join(invalid)
+            "Coder backend config has invalid fields: " + ", ".join(invalid)
         )
 
     forward_env = config.get("forward_env", [])
-    if not isinstance(forward_env, list) or any(
-        not isinstance(item, str) for item in forward_env
-    ):
-        raise ValueError("Coder backend config forward_env must be a list of strings")
     startup_timeout = config.get("workspace_startup_timeout", 180)
-    if (
-        not isinstance(startup_timeout, int)
-        or isinstance(startup_timeout, bool)
-        or startup_timeout <= 0
-    ):
-        raise ValueError(
-            "Coder backend config workspace_startup_timeout must be a positive integer"
-        )
 
     return CoderEnvironment(
         base_url=config["base_url"],
-        task_id=request.task_id,
+        task_id=task_id,
         api_key=config["api_key"],
         workspace_name=config["workspace_name"],
-        cwd=_remote_cwd(request),
-        timeout=request.timeout,
+        cwd=_remote_cwd(cwd),
+        timeout=timeout,
         forward_env=forward_env,
         workspace_startup_timeout=startup_timeout,
     )
 
 
-def coder_backend_definition() -> BackendDefinition:
-    """Return the static descriptor registered with Hermes' backend registry."""
-    return BackendDefinition(
-        name="coder",
-        label="Coder",
-        description="a remote Coder workspace (likely Linux)",
-        default_cwd="~",
-        factory=create_coder_environment,
-        availability_check=coder_backend_available,
-        config_availability_check=coder_backend_config_available,
-        capabilities=BackendCapabilities(
-            execution_location=ExecutionLocation.REMOTE,
-            filesystem_semantics=FilesystemSemantics.ISOLATED,
-            accepts_host_cwd=False,
-            requires_sandbox_cwd=True,
-            supports_image=False,
-            supports_resource_limits=False,
-            supports_pty=True,
-            supports_background_processes=True,
-            supports_file_transfer=False,
-            supports_persistence=True,
-        ),
-        config_schema={
+class CoderTerminalEnvironmentProvider(TerminalEnvironmentProvider):
+    """Hermes terminal-environment provider for an existing Coder workspace."""
+
+    name = "coder"
+    display_name = "Coder"
+    description = "Run commands in an existing remote Coder workspace."
+    env_description = "a remote Coder workspace (likely Linux)"
+    is_remote = True
+    is_container = True
+    # A Coder workspace is durable user infrastructure, not disposable storage.
+    skip_container_guards = False
+    cache_path_base = "~/.hermes"
+    strip_env_keys = frozenset({"CODER_API_KEY"})
+
+    def get_config_schema(self) -> dict[str, dict[str, Any]]:
+        return {
             "base_url": {
                 "type": "string",
                 "description": "Coder deployment URL",
@@ -193,16 +184,74 @@ def coder_backend_definition() -> BackendDefinition:
                 "env": "TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT",
                 "default": 180,
             },
-        },
-        config_resolver=resolve_coder_config,
-        install_hint=(
-            "Set terminal.backends.coder.base_url and workspace_name in the active "
-            "profile config, and set CODER_API_KEY in its environment."
-        ),
-        diagnostic_metadata={"transport": "coder-rest-pty"},
-    )
+        }
+
+    def resolve_config(self, config: Mapping[str, Any]) -> dict[str, Any]:
+        return resolve_coder_config(config)
+
+    def is_available(self) -> bool:
+        try:
+            return coder_backend_config_available(self.validated_config({}))
+        except Exception:  # noqa: BLE001 - availability must fail soft
+            return False
+
+    def check_requirements(self, config: dict[str, Any]) -> bool:
+        backend_config = config.get("backend_config")
+        if not isinstance(backend_config, Mapping):
+            logger.error("Coder backend configuration was not resolved")
+            return False
+        invalid = _invalid_config_fields(backend_config)
+        if invalid:
+            logger.error(
+                "Coder backend has invalid configuration fields: %s", ", ".join(invalid)
+            )
+            return False
+        return True
+
+    def probe(self) -> tuple[str, str]:
+        try:
+            return self.probe_with_config(self.validated_config({}))
+        except Exception:  # noqa: BLE001 - picker probes must not raise
+            return ("needs_setup", "Coder configuration is invalid.")
+
+    def probe_with_config(self, config: Mapping[str, Any]) -> tuple[str, str]:
+        invalid = _invalid_config_fields(config)
+        if invalid:
+            return ("needs_setup", f"Configure Coder fields: {', '.join(invalid)}.")
+        return ("ready", "")
+
+    def setup_instructions(self) -> list[str]:
+        api_key_instruction = (
+            "Set CODER_API_KEY in the active profile environment or enter it "
+            + "in the secret field."
+        )
+        return [
+            "Configure terminal.backends.coder.base_url and workspace_name.",
+            api_key_instruction,
+        ]
+
+    def create_environment(
+        self,
+        *,
+        cwd: str,
+        timeout: int,
+        task_id: str = "default",
+        image: str | None = None,
+        container_config: dict[str, Any] | None = None,
+        backend_config: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> CoderEnvironment:
+        return create_coder_environment(
+            cwd=cwd,
+            timeout=timeout,
+            task_id=task_id,
+            image=image,
+            container_config=container_config,
+            backend_config=backend_config,
+            **kwargs,
+        )
 
 
 def register(ctx) -> None:
-    """Register the Coder descriptor; resource creation remains host-owned."""
-    ctx.register_terminal_backend(coder_backend_definition())
+    """Register the Coder terminal environment provider with Hermes."""
+    ctx.register_terminal_environment_provider(CoderTerminalEnvironmentProvider())

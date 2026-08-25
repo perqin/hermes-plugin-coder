@@ -11,26 +11,23 @@ Current intentional limitations for the bootstrap step:
 from __future__ import annotations
 
 import codecs
+import contextlib
 import ipaddress
 import json
 import logging
+import os
 import re
 import shlex
 import threading
 import time
 import urllib.parse
 import uuid
+from collections.abc import Callable, Iterable
 
 import requests
+from tools.environments import BaseEnvironment
 from websockets.exceptions import ConnectionClosed, WebSocketException
 from websockets.sync.client import ClientConnection, connect
-
-from tools.environments import (
-    BaseEnvironment,
-    ThreadedProcessHandle,
-    collect_forwarded_env_values,
-    normalize_forward_env_names,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +36,112 @@ logger = logging.getLogger(__name__)
 # worker threads and make PTY reconnect tests race nondeterministically.
 _monotonic = time.monotonic
 _sleep = time.sleep
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_NON_FORWARDABLE_ENV = frozenset({"CODER_API_KEY"})
+
+
+class _Unset:
+    """Sentinel type distinguishing omitted constructor config from explicit null."""
+
+
+_UNSET = _Unset()
+
+
+def _normalize_forward_env_names(forward_env: Iterable[object] | None) -> list[str]:
+    """Return deduplicated valid names explicitly approved for forwarding."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in () if forward_env is None else forward_env:
+        if not isinstance(item, str):
+            logger.warning("Ignoring non-string coder forward_env entry")
+            continue
+        name = item.strip()
+        if not name or not _ENV_VAR_NAME_RE.fullmatch(name):
+            logger.warning("Ignoring invalid coder forward_env entry")
+            continue
+        if name in _NON_FORWARDABLE_ENV:
+            logger.warning("Ignoring non-forwardable Coder credential")
+            continue
+        if name not in seen:
+            seen.add(name)
+            normalized.append(name)
+    return normalized
+
+
+def _collect_forwarded_env_values(forward_env: list[str]) -> dict[str, str]:
+    """Resolve only explicitly configured names from the active process env."""
+    names = _normalize_forward_env_names(forward_env)
+    resolved: dict[str, str] = {}
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            resolved[name] = value
+    return resolved
+
+
+def _validate_coder_forward_env(value: object) -> list[str]:
+    """Validate and normalize the provider's forward_env list."""
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError("Coder forward_env must be a list of strings")
+    return _normalize_forward_env_names(value)
+
+
+def _validate_coder_startup_timeout(value: object) -> int:
+    """Validate and return the positive integer workspace startup timeout."""
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError("Coder workspace_startup_timeout must be a positive integer")
+    return value
+
+
+class _ThreadedProcessHandle:
+    """Adapt a blocking Coder PTY call to Hermes' process-handle protocol."""
+
+    def __init__(
+        self,
+        exec_fn: Callable[[], tuple[str, int]],
+        cancel_fn: Callable[[], None] | None = None,
+    ):
+        self._cancel_fn = cancel_fn
+        self._done = threading.Event()
+        self._returncode: int | None = None
+        read_fd, write_fd = os.pipe()
+        self._stdout = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
+        self._write_fd = write_fd
+
+        def worker() -> None:
+            try:
+                output, exit_code = exec_fn()
+                self._returncode = exit_code
+                with contextlib.suppress(OSError):
+                    os.write(self._write_fd, output.encode("utf-8", errors="replace"))
+            except Exception:  # noqa: BLE001 - process adapters fail as exit 1
+                self._returncode = 1
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(self._write_fd)
+                self._done.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @property
+    def stdout(self):
+        return self._stdout
+
+    @property
+    def returncode(self) -> int | None:
+        return self._returncode
+
+    def poll(self) -> int | None:
+        return self._returncode if self._done.is_set() else None
+
+    def kill(self) -> None:
+        if self._cancel_fn:
+            with contextlib.suppress(Exception):
+                self._cancel_fn()
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        self._done.wait(timeout=timeout)
+        return self._returncode
 
 
 class _BoundedPTYOutput:
@@ -121,6 +224,92 @@ def coder_workspace_exists(
     )
 
 
+def _normalize_coder_base_url(base_url: object) -> str:
+    """Validate a Coder API origin and return its canonical form."""
+    if (
+        not isinstance(base_url, str)
+        or not base_url
+        or base_url != base_url.strip()
+        or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in base_url
+        )
+    ):
+        raise ValueError(
+            "Coder base_url must not contain whitespace or control characters"
+        )
+    if "\\" in base_url:
+        raise ValueError("Coder base_url must not contain backslashes")
+    parsed_base_url = urllib.parse.urlsplit(base_url)
+    if parsed_base_url.netloc.endswith(":"):
+        raise ValueError("Coder base_url contains an empty port")
+    try:
+        parsed_port = parsed_base_url.port
+    except ValueError as exc:
+        raise ValueError("Coder base_url contains an invalid port") from exc
+    hostname = parsed_base_url.hostname or ""
+    if "%" in hostname:
+        raise ValueError("Coder base_url contains an invalid hostname")
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        labels = hostname.split(".")
+        if (
+            not re.fullmatch(r"[A-Za-z0-9.-]+", hostname)
+            or any(
+                not label
+                or len(label) > 63
+                or label.startswith("-")
+                or label.endswith("-")
+                for label in labels
+            )
+            or (hostname.replace(".", "").isdigit() and "." in hostname)
+        ):
+            raise ValueError("Coder base_url contains an invalid hostname") from None
+    if (
+        parsed_base_url.scheme != "https"
+        or not parsed_base_url.hostname
+        or parsed_base_url.username is not None
+        or parsed_base_url.password is not None
+        or parsed_base_url.query
+        or parsed_base_url.fragment
+        or parsed_base_url.path not in {"", "/"}
+    ):
+        raise ValueError(
+            "Coder base_url must be an HTTPS origin without credentials, "
+            "path, query, or fragment"
+        )
+    normalized_netloc = parsed_base_url.hostname
+    if ":" in normalized_netloc and not normalized_netloc.startswith("["):
+        normalized_netloc = f"[{normalized_netloc}]"
+    if parsed_port is not None:
+        normalized_netloc += f":{parsed_port}"
+    return urllib.parse.urlunsplit(
+        (parsed_base_url.scheme, normalized_netloc, "", "", "")
+    )
+
+
+def _validate_coder_api_key(api_key: object) -> str:
+    """Validate and return a credential safe for the Coder HTTP header."""
+    if (
+        not isinstance(api_key, str)
+        or not api_key
+        or any(not 0x21 <= ord(character) <= 0x7E for character in api_key)
+    ):
+        raise ValueError("Coder api_key must be a non-empty header-safe string")
+    return api_key
+
+
+def _normalize_coder_workspace_name(workspace_name: object) -> str:
+    """Validate and normalize the configured existing workspace name."""
+    workspace = workspace_name.strip() if isinstance(workspace_name, str) else ""
+    if not workspace:
+        raise ValueError(
+            "Coder environment requires explicit workspace_name (CODER_WORKSPACE)"
+        )
+    return workspace
+
+
 class CoderEnvironment(BaseEnvironment):
     """Execute commands inside a Coder workspace via the /pty websocket."""
 
@@ -146,8 +335,8 @@ class CoderEnvironment(BaseEnvironment):
         workspace_name: str | None = None,
         cwd: str = "~",
         timeout: int = 60,
-        forward_env: list[str] | None = None,
-        workspace_startup_timeout: int | None = None,
+        forward_env: list[str] | _Unset = _UNSET,
+        workspace_startup_timeout: int | _Unset = _UNSET,
         init_session: bool = True,
     ):
         super().__init__(cwd=cwd, timeout=timeout)
@@ -155,91 +344,24 @@ class CoderEnvironment(BaseEnvironment):
         # command internally consistent, this prevents concurrent environments
         # (and their test doubles) from changing one another's reconnect path.
         self._connect = connect
-        if (
-            not isinstance(base_url, str)
-            or not base_url
-            or base_url != base_url.strip()
-            or any(
-                character.isspace() or ord(character) < 32 or ord(character) == 127
-                for character in base_url
-            )
-        ):
-            raise ValueError(
-                "Coder base_url must not contain whitespace or control characters"
-            )
-        if "\\" in base_url:
-            raise ValueError("Coder base_url must not contain backslashes")
-        parsed_base_url = urllib.parse.urlsplit(base_url)
-        if parsed_base_url.netloc.endswith(":"):
-            raise ValueError("Coder base_url contains an empty port")
-        try:
-            parsed_port = parsed_base_url.port
-        except ValueError as exc:
-            raise ValueError("Coder base_url contains an invalid port") from exc
-        hostname = parsed_base_url.hostname or ""
-        if "%" in hostname:
-            raise ValueError("Coder base_url contains an invalid hostname")
-        try:
-            ipaddress.ip_address(hostname)
-        except ValueError:
-            labels = hostname.split(".")
-            if (
-                not re.fullmatch(r"[A-Za-z0-9.-]+", hostname)
-                or any(
-                    not label
-                    or len(label) > 63
-                    or label.startswith("-")
-                    or label.endswith("-")
-                    for label in labels
-                )
-                or (hostname.replace(".", "").isdigit() and "." in hostname)
-            ):
-                raise ValueError("Coder base_url contains an invalid hostname")
-        if (
-            parsed_base_url.scheme != "https"
-            or not parsed_base_url.hostname
-            or parsed_base_url.username is not None
-            or parsed_base_url.password is not None
-            or parsed_base_url.query
-            or parsed_base_url.fragment
-            or parsed_base_url.path not in {"", "/"}
-        ):
-            raise ValueError(
-                "Coder base_url must be an HTTPS origin without credentials, path, query, or fragment"
-            )
-        normalized_netloc = parsed_base_url.hostname
-        if ":" in normalized_netloc and not normalized_netloc.startswith("["):
-            normalized_netloc = f"[{normalized_netloc}]"
-        if parsed_port is not None:
-            normalized_netloc += f":{parsed_port}"
-        self.base_url = urllib.parse.urlunsplit(
-            (parsed_base_url.scheme, normalized_netloc, "", "", "")
-        )
+        self.base_url = _normalize_coder_base_url(base_url)
         self.task_id = task_id
-        workspace = (workspace_name or "").strip()
-        if not workspace:
-            raise ValueError(
-                "Coder environment requires explicit workspace_name (CODER_WORKSPACE)"
+        self.workspace = _normalize_coder_workspace_name(workspace_name)
+        self.api_key = _validate_coder_api_key(api_key)
+        if isinstance(workspace_startup_timeout, _Unset):
+            self._workspace_startup_timeout = self._snapshot_timeout
+        else:
+            self._workspace_startup_timeout = _validate_coder_startup_timeout(
+                workspace_startup_timeout
             )
-        self.workspace = workspace
-        if (
-            not isinstance(api_key, str)
-            or not api_key
-            or any(not 0x21 <= ord(character) <= 0x7E for character in api_key)
-        ):
-            raise ValueError("Coder api_key must be a non-empty header-safe string")
-        self.api_key = api_key
-        self._workspace_startup_timeout = self._snapshot_timeout
-        if workspace_startup_timeout is not None:
-            self._workspace_startup_timeout = int(workspace_startup_timeout)
-            self._snapshot_timeout = self._workspace_startup_timeout
+        self._snapshot_timeout = self._workspace_startup_timeout
         self._workspace_id: str | None = None
         self._cleanup_complete = False
         self._session_cleanup_needed = False
         self._cleanup_lock = threading.Lock()
-        self._forward_env = normalize_forward_env_names(
-            forward_env, config_name="coder_forward_env"
-        )
+        if isinstance(forward_env, _Unset):
+            forward_env = []
+        self._forward_env = _validate_coder_forward_env(forward_env)
 
         # Safe to call here: init_session() uses _run_bash() directly, which
         # resolves the workspace/agent and opens a PTY without going back
@@ -260,15 +382,15 @@ class CoderEnvironment(BaseEnvironment):
         return f"{self.base_url}/api/v2/workspaces/{workspace_id}"
 
     def _workspace_build_url(self, build_id: str) -> str:
-        return f"{self.base_url}/api/v2/workspacebuilds/{urllib.parse.quote(build_id, safe='')}"
+        quoted_id = urllib.parse.quote(build_id, safe="")
+        return f"{self.base_url}/api/v2/workspacebuilds/{quoted_id}"
 
     def _workspace_builds_url(self, workspace_id: str) -> str:
-        return f"{self.base_url}/api/v2/workspaces/{urllib.parse.quote(workspace_id, safe='')}/builds"
+        quoted_id = urllib.parse.quote(workspace_id, safe="")
+        return f"{self.base_url}/api/v2/workspaces/{quoted_id}/builds"
 
     @staticmethod
-    def _startup_deadline(
-        timeout: int | float, workspace_startup_timeout: int | float
-    ) -> float:
+    def _startup_deadline(timeout: float, workspace_startup_timeout: float) -> float:
         # Startup REST polling is part of the command, so it must respect both
         # the command timeout and the Coder-specific startup bound.
         return _monotonic() + max(
@@ -358,7 +480,8 @@ class CoderEnvironment(BaseEnvironment):
         build_id = payload.get("id")
         if not build_id:
             raise RuntimeError(
-                f"Coder start build for workspace {self.workspace!r} did not return a build id"
+                f"Coder start build for workspace {self.workspace!r} did not "
+                "return a build id"
             )
         return build_id
 
@@ -390,7 +513,8 @@ class CoderEnvironment(BaseEnvironment):
             if job.get("completed_at"):
                 if status != "succeeded":
                     raise RuntimeError(
-                        f"Coder workspace build {build_id} finished with status {status or 'unknown'}"
+                        f"Coder workspace build {build_id} finished with status "
+                        f"{status or 'unknown'}"
                     )
                 return
             _sleep(min(2, max(0.0, deadline - _monotonic())))
@@ -407,10 +531,7 @@ class CoderEnvironment(BaseEnvironment):
             return False
 
         lifecycle_state = str(agent.get("lifecycle_state") or "").strip().lower()
-        if lifecycle_state != "ready":
-            return False
-
-        return True
+        return lifecycle_state == "ready"
 
     def _wait_for_agent_ready(
         self,
@@ -442,7 +563,7 @@ class CoderEnvironment(BaseEnvironment):
     def _resolve_agent_id(
         self,
         *,
-        timeout: int | float | None = None,
+        timeout: float | None = None,
         deadline: float | None = None,
         cancel_state: dict | None = None,
     ) -> str:
@@ -463,7 +584,8 @@ class CoderEnvironment(BaseEnvironment):
                 raise RuntimeError(f"Coder workspace {self.workspace!r} is deleted")
             if (latest_build.get("status") or "").lower() != "stopped":
                 raise RuntimeError(
-                    f"Coder workspace {self.workspace!r} must be started before terminal execution"
+                    f"Coder workspace {self.workspace!r} must be started before "
+                    "terminal execution"
                 )
             workspace_id = payload.get("id")
             if not workspace_id:
@@ -544,9 +666,7 @@ class CoderEnvironment(BaseEnvironment):
 
     def _build_init_env_exports(self) -> str:
         """Build shell exports that seed forwarded env vars into the snapshot."""
-        env = collect_forwarded_env_values(
-            self._forward_env, config_name="coder_forward_env"
-        )
+        env = _collect_forwarded_env_values(self._forward_env)
         if not env:
             return ""
         return "\n".join(
@@ -609,12 +729,10 @@ class CoderEnvironment(BaseEnvironment):
             frame = cls._stdin_frame("\u0003")
             websocket.send(frame)
             sent = True
-        except Exception:
-            pass
-        try:
+        except Exception:  # noqa: BLE001 - best-effort cancellation
+            logger.debug("[coder] Unable to send PTY interrupt")
+        with contextlib.suppress(Exception):
             websocket.close()
-        except Exception:
-            pass
         return sent
 
     def _interrupt_reconnected_pty(self, pty_url: str, timeout: float) -> bool:
@@ -627,11 +745,10 @@ class CoderEnvironment(BaseEnvironment):
                 close_timeout=1,
             ) as websocket:
                 return self._interrupt_pty(websocket)
-        except Exception:
+        except Exception:  # noqa: BLE001 - transport exceptions vary by version
             logger.warning(
                 "[coder] Unable to reconnect PTY for deadline interrupt: workspace=%s",
                 self.workspace,
-                exc_info=True,
             )
             return False
 
@@ -737,7 +854,8 @@ class CoderEnvironment(BaseEnvironment):
                 )
             else:
                 suggestion = (
-                    f"Shorten the command to roughly {suggested_command_length} characters "
+                    f"Shorten the command to roughly {suggested_command_length} "
+                    "characters "
                     "or put the script in a file/stdin and execute that instead."
                 )
             return (
@@ -789,11 +907,12 @@ class CoderEnvironment(BaseEnvironment):
                     try:
                         if self._cancel_requested(cancel_state):
                             self._wait_for_cancel_interrupt(cancel_state)
-                            if not self._cancel_interrupt_sent(
-                                cancel_state
-                            ) and not self._cancel_interrupt_in_flight(cancel_state):
-                                if self._interrupt_pty(websocket):
-                                    self._mark_cancel_interrupt_sent(cancel_state)
+                            if (
+                                not self._cancel_interrupt_sent(cancel_state)
+                                and not self._cancel_interrupt_in_flight(cancel_state)
+                                and self._interrupt_pty(websocket)
+                            ):
+                                self._mark_cancel_interrupt_sent(cancel_state)
                             continue
 
                         if stdin_data is not None and not stdin_send_attempted:
@@ -842,13 +961,12 @@ class CoderEnvironment(BaseEnvironment):
                             with cancel_state["lock"]:
                                 if cancel_state.get("websocket") is websocket:
                                     cancel_state["websocket"] = None
-            except (OSError, TimeoutError, WebSocketException) as exc:
+            except (OSError, TimeoutError, WebSocketException):
                 logger.warning(
                     "[coder] PTY connection failed; retrying same session: "
-                    "workspace=%s reconnect_id=%s error=%s",
+                    "workspace=%s reconnect_id=%s",
                     self.workspace,
                     reconnect_id,
-                    exc,
                 )
 
             if marker_received or deadline_expired:
@@ -911,7 +1029,14 @@ class CoderEnvironment(BaseEnvironment):
         if login:
             exports = self._build_init_env_exports()
             if exports:
-                cmd_string = f"{exports}\n{cmd_string}"
+                if stdin_data is not None:
+                    raise ValueError(
+                        "Coder login initialization cannot combine forwarded "
+                        "environment with caller stdin_data"
+                    )
+                stdin_data = f"{exports}\n{cmd_string}\n"
+                cmd_string = "bash -l -s"
+                login = False
 
         cancel_state = {
             "lock": threading.Lock(),
@@ -955,7 +1080,7 @@ class CoderEnvironment(BaseEnvironment):
                 daemon=True,
             ).start()
 
-        return ThreadedProcessHandle(
+        return _ThreadedProcessHandle(
             lambda: self._execute_via_pty(
                 cmd_string,
                 login=login,
@@ -996,19 +1121,22 @@ class CoderEnvironment(BaseEnvironment):
             except TimeoutError:
                 process.kill()
                 logger.warning(
-                    "[coder] Timed out removing remote session snapshot files: workspace=%s",
+                    "[coder] Timed out removing remote session snapshot files: "
+                    "workspace=%s",
                     self.workspace,
                 )
                 return
             if returncode is None:
                 process.kill()
                 logger.warning(
-                    "[coder] Timed out removing remote session snapshot files: workspace=%s",
+                    "[coder] Timed out removing remote session snapshot files: "
+                    "workspace=%s",
                     self.workspace,
                 )
             elif returncode != 0:
                 logger.warning(
-                    "[coder] Remote session snapshot cleanup failed: workspace=%s returncode=%s",
+                    "[coder] Remote session snapshot cleanup failed: "
+                    "workspace=%s returncode=%s",
                     self.workspace,
                     returncode,
                 )
@@ -1016,9 +1144,8 @@ class CoderEnvironment(BaseEnvironment):
                 self._cleanup_complete = True
                 self._session_cleanup_needed = False
                 self._snapshot_ready = False
-        except Exception:
+        except Exception:  # noqa: BLE001 - cleanup must remain best effort
             logger.warning(
                 "[coder] Failed to remove remote session snapshot files: workspace=%s",
                 self.workspace,
-                exc_info=True,
             )

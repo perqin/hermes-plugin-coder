@@ -2,8 +2,8 @@ import json
 import re
 import threading
 import uuid
-from urllib.parse import parse_qs, urlparse
 from unittest.mock import MagicMock
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from websockets.exceptions import WebSocketException
@@ -15,6 +15,7 @@ class _FakeWebSocket:
     def __init__(self, messages):
         self._messages = list(messages)
         self.requested = []
+        self.sent = []
 
     def __enter__(self):
         return self
@@ -30,6 +31,9 @@ class _FakeWebSocket:
         if isinstance(message, BaseException):
             raise message
         return message
+
+    def send(self, message):
+        self.sent.append(message)
 
 
 class _FakeResponse:
@@ -143,6 +147,78 @@ def test_coder_environment_uses_workspace_startup_timeout():
     assert env._snapshot_timeout == 240
 
 
+def test_coder_provider_credential_cannot_be_forwarded_to_remote_shell(monkeypatch):
+    monkeypatch.setenv("CODER_API_KEY", "TOP-SECRET-CODER-TOKEN")
+    env = CoderEnvironment(
+        base_url="https://coder.example",
+        task_id="task-coder",
+        api_key="TOP-SECRET-CODER-TOKEN",
+        workspace_name="shared-dev",
+        forward_env=["CODER_API_KEY"],
+        init_session=False,
+    )
+
+    exports = env._build_init_env_exports()
+
+    assert "CODER_API_KEY" not in exports
+    assert "TOP-SECRET-CODER-TOKEN" not in exports
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("forward_env", None),
+        ("forward_env", "TOKEN"),
+        ("forward_env", ("TOKEN",)),
+        ("forward_env", {"TOKEN": "value"}),
+        ("forward_env", [object()]),
+        ("workspace_startup_timeout", None),
+        ("workspace_startup_timeout", True),
+        ("workspace_startup_timeout", 0),
+        ("workspace_startup_timeout", -1),
+        ("workspace_startup_timeout", "180"),
+    ],
+)
+def test_direct_constructor_rejects_provider_config_shapes_rejected_by_factory(
+    field, value
+):
+    kwargs = {
+        "base_url": "https://coder.example",
+        "task_id": "task-coder",
+        "api_key": "secret-token",
+        "workspace_name": "shared-dev",
+        "init_session": False,
+        field: value,
+    }
+
+    with pytest.raises(ValueError, match=field):
+        CoderEnvironment(**kwargs)
+
+
+def test_forwarded_values_use_pty_stdin_instead_of_request_url(monkeypatch):
+    monkeypatch.setenv("FORWARDED_TOKEN", "AUDIT_SECRET_CANARY")
+    env = CoderEnvironment(
+        base_url="https://coder.example",
+        task_id="task-coder",
+        api_key="secret-token",
+        workspace_name="shared-dev",
+        forward_env=["FORWARDED_TOKEN"],
+        init_session=False,
+    )
+    execute = MagicMock(return_value=("", 0))
+    monkeypatch.setattr(env, "_execute_via_pty", execute)
+
+    process = env._run_bash("printf initialized", login=True, timeout=5)
+    assert process.wait(timeout=2) == 0
+    command = execute.call_args.args[0]
+    stdin_data = execute.call_args.kwargs["stdin_data"]
+
+    assert "AUDIT_SECRET_CANARY" not in command
+    assert "FORWARDED_TOKEN" not in command
+    assert "AUDIT_SECRET_CANARY" in stdin_data
+    assert "FORWARDED_TOKEN" in stdin_data
+
+
 def test_coder_environment_initializes_session_snapshot_without_recursive_execute(
     monkeypatch,
 ):
@@ -173,25 +249,29 @@ def test_coder_environment_initializes_session_snapshot_without_recursive_execut
         ]
     )
     connect_urls = []
+    connected_websockets = []
+    cwd_marker = "__HERMES_CWD_1234567890ab__"
 
     def fake_connect(url, **_kwargs):
         connect_urls.append(url)
         query = parse_qs(urlparse(url).query)
         reconnect_id = query["reconnect"][0]
         exit_marker = f"__HERMES_EXIT_{reconnect_id}__"
-        command = query["command"][0]
-        cwd_match = re.search(r"__HERMES_CWD_[0-9a-f]{12}__", command)
-        assert cwd_match is not None
-        cwd_marker = cwd_match.group(0)
-        return _FakeWebSocket(
+        websocket = _FakeWebSocket(
             [
                 f"\n{cwd_marker}/home/coder{cwd_marker}\n\n{exit_marker}0{exit_marker}\n".encode()
             ]
         )
+        connected_websockets.append(websocket)
+        return websocket
 
     monkeypatch.setattr("hermes_plugin_coder.backend.requests.get", requests_get)
     monkeypatch.setattr("hermes_plugin_coder.backend.requests.post", MagicMock())
     monkeypatch.setattr("hermes_plugin_coder.backend.connect", fake_connect)
+    monkeypatch.setattr(
+        "tools.environments.base.uuid.uuid4",
+        lambda: uuid.UUID("12345678-90ab-cdef-1234-567890abcdef"),
+    )
     monkeypatch.setenv("HERMES_CODER_SNAPSHOT_TEST", "forwarded-value")
 
     env = CoderEnvironment(
@@ -209,10 +289,15 @@ def test_coder_environment_initializes_session_snapshot_without_recursive_execut
     init_query = parse_qs(urlparse(connect_urls[0]).query)
     init_command = init_query["command"][0]
     assert init_command.startswith("bash -c ")
-    assert "bash -lc" in init_command
-    assert "export HERMES_CODER_SNAPSHOT_TEST=forwarded-value" in init_command
-    assert "export -p" in init_command
-    assert "declare -f" in init_command
+    assert "bash -l -s" in init_command
+    assert "HERMES_CODER_SNAPSHOT_TEST" not in init_command
+    assert "forwarded-value" not in init_command
+    init_stdin = "".join(
+        json.loads(frame)["data"] for frame in connected_websockets[0].sent
+    )
+    assert "export HERMES_CODER_SNAPSHOT_TEST=forwarded-value" in init_stdin
+    assert "export -p" in init_stdin
+    assert "declare -f" in init_stdin
 
     env.execute("printf $HERMES_CODER_SNAPSHOT_TEST")
 
@@ -520,7 +605,7 @@ def test_coder_environment_reconnects_after_partial_output_before_marker(monkeyp
     [OSError("temporary connect failure"), WebSocketException("handshake failed")],
 )
 def test_coder_environment_retries_connect_error_after_partial_output(
-    monkeypatch, connect_error
+    monkeypatch, connect_error, caplog
 ):
     reconnect_id = uuid.UUID("22222222-3333-4444-5555-888888888888")
     exit_marker = f"__HERMES_EXIT_{reconnect_id}__"
@@ -550,6 +635,7 @@ def test_coder_environment_retries_connect_error_after_partial_output(
 
     assert result == ("partial\ndone", 0)
     assert connect_mock.call_count == 3
+    assert str(connect_error) not in caplog.text
 
 
 def test_coder_environment_interrupts_when_cancelled_during_reconnect_error(
@@ -1310,6 +1396,29 @@ def test_coder_cleanup_removes_session_snapshot_files(monkeypatch):
     run_bash.assert_called_once()
     process.wait.assert_called_once_with(timeout=5)
     assert env._snapshot_ready is False
+
+
+def test_coder_transport_and_cleanup_logs_omit_exception_values(monkeypatch, caplog):
+    env = CoderEnvironment(
+        base_url="https://coder.example",
+        task_id="task-coder",
+        api_key="secret-token",
+        workspace_name="shared-dev",
+        init_session=False,
+    )
+    env._connect = MagicMock(side_effect=RuntimeError("TOP-SECRET-TRANSPORT"))
+
+    assert env._interrupt_reconnected_pty("wss://coder.example/pty", 1) is False
+
+    env._workspace_id = "workspace-123"
+    env._session_cleanup_needed = True
+    monkeypatch.setattr(
+        env, "_run_bash", MagicMock(side_effect=RuntimeError("TOP-SECRET-CLEANUP"))
+    )
+    env.cleanup()
+
+    assert "TOP-SECRET-TRANSPORT" not in caplog.text
+    assert "TOP-SECRET-CLEANUP" not in caplog.text
 
 
 def test_coder_cleanup_retries_after_failure_then_becomes_idempotent(monkeypatch):

@@ -1,8 +1,8 @@
-"""Coder terminal backend plugin package."""
+"""Coder terminal environment provider plugin package."""
 
 from .backend import CoderEnvironment, coder_workspace_exists
 from .plugin import (
-    coder_backend_definition,
+    CoderTerminalEnvironmentProvider,
     create_coder_environment,
     register,
     resolve_coder_config,
@@ -10,7 +10,7 @@ from .plugin import (
 
 __all__ = [
     "CoderEnvironment",
-    "coder_backend_definition",
+    "CoderTerminalEnvironmentProvider",
     "coder_workspace_exists",
     "create_coder_environment",
     "register",
