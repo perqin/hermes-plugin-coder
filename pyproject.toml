@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-plugin-coder"
+version = "0.1.0"
+description = "Coder terminal backend plugin for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Perqin", email = "perqinxie@gmail.com"},
+]
+dependencies = [
+    "requests>=2.33.0",
+    "websockets>=15.0.1",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+]
+
+[project.entry-points."hermes_agent.plugins"]
+coder = "hermes_plugin_coder.plugin"
+
+[project.urls]
+Homepage = "https://github.com/perqin/hermes-plugin-coder"
+
+[tool.setuptools.packages.find]
+include = ["hermes_plugin_coder*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

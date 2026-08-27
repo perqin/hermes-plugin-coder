@@ -1,0 +1,5 @@
+name: coder
+kind: backend
+version: 0.1.0
+description: Coder remote-workspace terminal backend for Hermes Agent
+entry: __init__.py
