@@ -195,7 +195,7 @@ def test_direct_constructor_rejects_provider_config_shapes_rejected_by_factory(
         CoderEnvironment(**kwargs)
 
 
-def test_forwarded_values_use_pty_stdin_instead_of_request_url(monkeypatch):
+def test_forwarded_login_script_uses_pty_stdin_and_explicit_exit(monkeypatch):
     monkeypatch.setenv("FORWARDED_TOKEN", "AUDIT_SECRET_CANARY")
     env = CoderEnvironment(
         base_url="https://coder.example",
@@ -217,6 +217,7 @@ def test_forwarded_values_use_pty_stdin_instead_of_request_url(monkeypatch):
     assert "FORWARDED_TOKEN" not in command
     assert "AUDIT_SECRET_CANARY" in stdin_data
     assert "FORWARDED_TOKEN" in stdin_data
+    assert stdin_data.endswith("\nbuiltin exit\n")
 
 
 def test_coder_environment_initializes_session_snapshot_without_recursive_execute(

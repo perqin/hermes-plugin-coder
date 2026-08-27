@@ -1034,7 +1034,11 @@ class CoderEnvironment(BaseEnvironment):
                         "Coder login initialization cannot combine forwarded "
                         "environment with caller stdin_data"
                     )
-                stdin_data = f"{exports}\n{cmd_string}\n"
+                # Coder's PTY protocol has no stdin-close message. A literal
+                # Ctrl+D terminates cat/sh in canonical mode but does not make
+                # bash -s exit reliably, so terminate this fixed init script
+                # explicitly instead of waiting for PTY EOF.
+                stdin_data = f"{exports}\n{cmd_string}\nbuiltin exit\n"
                 cmd_string = "bash -l -s"
                 login = False
 
