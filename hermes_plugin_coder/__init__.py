@@ -5,7 +5,6 @@ from .plugin import (
     CoderTerminalEnvironmentProvider,
     create_coder_environment,
     register,
-    resolve_coder_config,
 )
 
 __all__ = [
@@ -14,5 +13,4 @@ __all__ = [
     "coder_workspace_exists",
     "create_coder_environment",
     "register",
-    "resolve_coder_config",
 ]

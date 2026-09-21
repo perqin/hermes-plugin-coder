@@ -10,38 +10,19 @@ Third-party [Coder](https://coder.com/) terminal environment provider for Hermes
 
 ## Configuration
 
-Select Coder and store its non-secret settings in the active Hermes profile config:
-
-```yaml
-terminal:
-  backend: coder
-  backends:
-    coder:
-      base_url: https://coder.example.com
-      workspace_name: my-workspace
-      forward_env:
-        - GITHUB_TOKEN
-      workspace_startup_timeout: 180
-```
-
-Keep the Coder API key in the active profile's `.env` (recommended):
-
-```dotenv
-CODER_API_KEY=...
-```
-
-Every schema field can also be overridden through its declared environment variable:
+Upstream Hermes currently passes only the standard provider factory arguments to terminal plugins, so this compatibility branch reads Coder settings from the active profile environment:
 
 ```dotenv
 CODER_URL=https://coder.example.com
+CODER_API_KEY=...
 CODER_WORKSPACE=my-workspace
 TERMINAL_CODER_FORWARD_ENV=["GITHUB_TOKEN"]
 TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT=180
 ```
 
-Runtime precedence is environment variable, then profile YAML, then the backend default. An explicitly set but invalid or empty environment override fails closed instead of falling back to YAML.
+The first three variables are required. `TERMINAL_CODER_FORWARD_ENV` defaults to `[]`, and `TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT` defaults to `180`. Invalid or explicitly empty values fail closed.
 
-The Dashboard/Desktop schema also exposes `api_key` as a masked secret field under `terminal.backends.coder`. `CODER_API_KEY` takes precedence when it is present. The key is used only for Coder REST and PTY WebSocket authentication, is stripped from model-authored subprocesses, and is never included in probe details.
+Profile YAML under `terminal.backends.coder`, Dashboard/Desktop configuration fields, and config-aware probing are temporarily unavailable until upstream Hermes gains the provider-owned configuration contract. The API key remains stripped from model-authored subprocesses and is never included in probe details.
 
 ## Development installation
 
@@ -52,7 +33,7 @@ ln -s /path/to/hermes-plugin-coder "${HERMES_HOME:-$HOME/.hermes}/plugins/coder-
 hermes plugins enable coder
 ```
 
-The symlink makes the source plugin discoverable; `plugins enable` opts it into the active profile. Select it with `hermes config set terminal.backend coder`. The plugin registers a `TerminalEnvironmentProvider`; Hermes owns profile-scoped config resolution, environment creation, and task lifecycle.
+The symlink makes the source plugin discoverable; `plugins enable` opts it into the active profile. Select it with `hermes config set terminal.backend coder`. The plugin registers a `TerminalEnvironmentProvider`; upstream Hermes owns environment creation and task lifecycle, while this compatibility branch resolves Coder settings from the active profile environment.
 
 Coder workspaces are durable user infrastructure, so the provider keeps dangerous-command guards enabled even though it uses isolated remote filesystem semantics. Only names explicitly listed in `forward_env` are copied into the remote session snapshot. Their values are delivered after the authenticated PTY WebSocket opens and are never placed in its request URL.
 

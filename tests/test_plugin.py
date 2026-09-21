@@ -12,6 +12,10 @@ _REQUIRED_ENV = {
     "CODER_API_KEY": "secret-token",
     "CODER_WORKSPACE": "shared-dev",
 }
+_OPTIONAL_ENV = (
+    "TERMINAL_CODER_FORWARD_ENV",
+    "TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT",
+)
 
 
 def _set_required_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -19,16 +23,9 @@ def _set_required_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(name, value)
 
 
-def _resolved_config(**overrides):
-    config = {
-        "base_url": "https://coder.example",
-        "api_key": "secret-token",
-        "workspace_name": "shared-dev",
-        "forward_env": [],
-        "workspace_startup_timeout": 180,
-    }
-    config.update(overrides)
-    return config
+def _clear_coder_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (*_REQUIRED_ENV, *_OPTIONAL_ENV):
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_register_adds_coder_terminal_environment_provider():
@@ -50,50 +47,20 @@ def test_register_adds_coder_terminal_environment_provider():
     assert provider.strip_env_keys == frozenset({"CODER_API_KEY"})
 
 
-def test_manifest_does_not_gate_profile_configured_provider_on_environment():
+def test_manifest_does_not_gate_provider_discovery_before_setup():
     manifest = yaml.safe_load((Path(__file__).parents[1] / "plugin.yaml").read_text())
 
     assert manifest["name"] == "coder"
     assert "requires_env" not in manifest
 
 
-def test_coder_config_schema_uses_dashboard_contract_types():
+def test_provider_does_not_define_feature_branch_config_hooks():
     from hermes_plugin_coder.plugin import CoderTerminalEnvironmentProvider
 
-    schema = CoderTerminalEnvironmentProvider().validated_config_schema()
-
-    assert schema == {
-        "base_url": {
-            "type": "string",
-            "description": "Coder deployment URL",
-            "env": "CODER_URL",
-            "required": True,
-        },
-        "api_key": {
-            "type": "secret",
-            "description": "Coder API key",
-            "env": "CODER_API_KEY",
-            "required": True,
-        },
-        "workspace_name": {
-            "type": "string",
-            "description": "Coder workspace name",
-            "env": "CODER_WORKSPACE",
-            "required": True,
-        },
-        "forward_env": {
-            "type": "list",
-            "description": "Environment variables forwarded to the workspace",
-            "env": "TERMINAL_CODER_FORWARD_ENV",
-            "default": [],
-        },
-        "workspace_startup_timeout": {
-            "type": "number",
-            "description": "Workspace startup timeout in seconds",
-            "env": "TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT",
-            "default": 180,
-        },
-    }
+    provider_methods = CoderTerminalEnvironmentProvider.__dict__
+    assert "get_config_schema" not in provider_methods
+    assert "resolve_config" not in provider_methods
+    assert "probe_with_config" not in provider_methods
 
 
 def test_coder_availability_requires_all_connection_environment(monkeypatch):
@@ -109,129 +76,76 @@ def test_coder_availability_requires_all_connection_environment(monkeypatch):
     assert provider.is_available() is True
 
 
-def test_coder_probe_and_requirements_use_resolved_backend_config(monkeypatch, caplog):
+def test_coder_probe_and_requirements_use_process_environment(monkeypatch, caplog):
     from hermes_plugin_coder.plugin import CoderTerminalEnvironmentProvider
 
-    for name in _REQUIRED_ENV:
-        monkeypatch.delenv(name, raising=False)
     provider = CoderTerminalEnvironmentProvider()
-    ready = _resolved_config()
+    _clear_coder_env(monkeypatch)
 
-    assert provider.probe_with_config(ready) == ("ready", "")
-    assert provider.check_requirements({"backend_config": ready}) is True
-
-    incomplete = {
-        "base_url": ready["base_url"],
-        "workspace_name": ready["workspace_name"],
-    }
-    assert provider.probe_with_config(incomplete) == (
+    assert provider.probe() == (
         "needs_setup",
-        "Configure Coder fields: api_key.",
+        "Configure Coder environment variables: base_url, api_key, workspace_name.",
     )
-    assert provider.check_requirements({"backend_config": incomplete}) is False
-    assert "api_key" in caplog.text
+    assert provider.check_requirements({"env_type": "coder"}) is False
+    assert "base_url, api_key, workspace_name" in caplog.text
     assert "secret-token" not in caplog.text
 
-
-@pytest.mark.parametrize(
-    ("overrides", "invalid_field"),
-    [
-        ({"forward_env": "not-a-list"}, "forward_env"),
-        ({"workspace_startup_timeout": True}, "workspace_startup_timeout"),
-        ({"workspace_startup_timeout": 0}, "workspace_startup_timeout"),
-    ],
-)
-def test_probe_and_requirements_reject_config_that_factory_rejects(
-    overrides, invalid_field, caplog
-):
-    from hermes_plugin_coder.plugin import CoderTerminalEnvironmentProvider
-
-    provider = CoderTerminalEnvironmentProvider()
-    config = _resolved_config(**overrides)
-
-    assert provider.probe_with_config(config) == (
-        "needs_setup",
-        f"Configure Coder fields: {invalid_field}.",
-    )
-    assert provider.check_requirements({"backend_config": config}) is False
-    assert invalid_field in caplog.text
-
-    with pytest.raises(ValueError, match=invalid_field):
-        provider.create_environment(cwd="~", timeout=60, backend_config=config)
+    _set_required_env(monkeypatch)
+    assert provider.probe() == ("ready", "")
+    assert provider.check_requirements({"env_type": "coder"}) is True
 
 
 @pytest.mark.parametrize(
-    ("overrides", "invalid_field"),
+    ("name", "value", "invalid_field"),
     [
-        ({"base_url": "http://coder.example"}, "base_url"),
-        ({"base_url": "https://coder.example/path"}, "base_url"),
-        ({"api_key": "token\nInjected: value"}, "api_key"),
-        ({"api_key": "é"}, "api_key"),
-        ({"workspace_name": "   "}, "workspace_name"),
+        ("CODER_URL", "http://coder.example", "base_url"),
+        ("CODER_API_KEY", "token\nInjected: value", "api_key"),
+        ("CODER_WORKSPACE", "   ", "workspace_name"),
+        ("TERMINAL_CODER_FORWARD_ENV", "not-json", "forward_env"),
+        (
+            "TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT",
+            "0",
+            "workspace_startup_timeout",
+        ),
     ],
 )
-def test_probe_requirements_and_factory_share_strict_connection_validation(
-    overrides, invalid_field, caplog
+def test_probe_requirements_and_factory_share_environment_validation(
+    monkeypatch, caplog, name, value, invalid_field
 ):
     from hermes_plugin_coder.plugin import CoderTerminalEnvironmentProvider
 
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv(name, value)
     provider = CoderTerminalEnvironmentProvider()
-    config = _resolved_config(**overrides)
 
-    assert provider.probe_with_config(config) == (
+    assert provider.probe() == (
         "needs_setup",
-        f"Configure Coder fields: {invalid_field}.",
+        f"Configure Coder environment variables: {invalid_field}.",
     )
-    assert provider.check_requirements({"backend_config": config}) is False
+    assert provider.check_requirements({"env_type": "coder"}) is False
     assert invalid_field in caplog.text
+    if value.strip():
+        assert value not in caplog.text
 
     with pytest.raises(ValueError, match=invalid_field):
-        provider.create_environment(cwd="~", timeout=60, backend_config=config)
+        provider.create_environment(cwd="~", timeout=60)
 
 
-def test_provider_resolves_profile_yaml_with_environment_secret(monkeypatch):
-    from hermes_plugin_coder.plugin import CoderTerminalEnvironmentProvider
-
-    monkeypatch.delenv("CODER_URL", raising=False)
-    monkeypatch.delenv("CODER_WORKSPACE", raising=False)
-    monkeypatch.delenv("TERMINAL_CODER_FORWARD_ENV", raising=False)
-    monkeypatch.delenv("TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT", raising=False)
-    monkeypatch.setenv("CODER_API_KEY", "secret-token")
-    raw_config = {
-        "base_url": "https://coder.example",
-        "workspace_name": "shared-dev",
-        "forward_env": ["GITHUB_TOKEN"],
-        "workspace_startup_timeout": 500,
-    }
-
-    assert CoderTerminalEnvironmentProvider().validated_config(raw_config) == {
-        "base_url": "https://coder.example",
-        "api_key": "secret-token",
-        "workspace_name": "shared-dev",
-        "forward_env": ["GITHUB_TOKEN"],
-        "workspace_startup_timeout": 500,
-    }
-
-
-def test_factory_builds_coder_environment_from_backend_config_and_host_kwargs(
-    monkeypatch,
-):
+def test_factory_builds_coder_environment_from_process_environment(monkeypatch):
     from hermes_plugin_coder import plugin
 
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_CODER_FORWARD_ENV", '["GITHUB_TOKEN", "CUSTOM_VALUE"]')
+    monkeypatch.setenv("TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT", "240")
     constructor = MagicMock(return_value=MagicMock())
     monkeypatch.setattr(plugin, "CoderEnvironment", constructor)
-    provider = plugin.CoderTerminalEnvironmentProvider()
 
-    result = provider.create_environment(
+    result = plugin.CoderTerminalEnvironmentProvider().create_environment(
         cwd="/worktree",
         timeout=45,
         task_id="task-coder",
         image="ignored",
         container_config={"container_cpu": 2},
-        backend_config=_resolved_config(
-            forward_env=["GITHUB_TOKEN", "CUSTOM_VALUE"],
-            workspace_startup_timeout=240,
-        ),
         future_host_field="ignored",
     )
 
@@ -248,141 +162,60 @@ def test_factory_builds_coder_environment_from_backend_config_and_host_kwargs(
     )
 
 
+def test_factory_ignores_feature_branch_backend_config_payload(monkeypatch):
+    from hermes_plugin_coder import plugin
+
+    _set_required_env(monkeypatch)
+    constructor = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(plugin, "CoderEnvironment", constructor)
+
+    plugin.CoderTerminalEnvironmentProvider().create_environment(
+        cwd="~",
+        timeout=60,
+        backend_config={
+            "base_url": "https://feature-branch.example",
+            "api_key": "feature-branch-token",
+            "workspace_name": "feature-branch-workspace",
+        },
+    )
+
+    assert constructor.call_args.kwargs["base_url"] == "https://coder.example"
+    assert constructor.call_args.kwargs["api_key"] == "secret-token"
+    assert constructor.call_args.kwargs["workspace_name"] == "shared-dev"
+
+
 def test_factory_defaults_generated_root_cwd_to_remote_home(monkeypatch):
     from hermes_plugin_coder import plugin
 
+    _set_required_env(monkeypatch)
     constructor = MagicMock(return_value=MagicMock())
     monkeypatch.setattr(plugin, "CoderEnvironment", constructor)
 
     plugin.CoderTerminalEnvironmentProvider().create_environment(
         cwd="/root",
         timeout=60,
-        backend_config=_resolved_config(),
     )
 
     assert constructor.call_args.kwargs["cwd"] == "~"
 
 
-def test_config_resolver_uses_environment_over_yaml_over_defaults(monkeypatch):
-    from hermes_plugin_coder.plugin import resolve_coder_config
+def test_environment_loader_supplies_optional_defaults(monkeypatch):
+    from hermes_plugin_coder.plugin import _load_coder_environment_config
 
     _set_required_env(monkeypatch)
-    monkeypatch.setenv("TERMINAL_CODER_FORWARD_ENV", '["ENV_TOKEN"]')
-    monkeypatch.setenv("TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT", "240")
-
-    assert resolve_coder_config(
-        {
-            "base_url": "https://yaml.example",
-            "api_key": "yaml-token",
-            "workspace_name": "yaml-workspace",
-            "forward_env": ["YAML_TOKEN"],
-            "workspace_startup_timeout": 500,
-        }
-    ) == _resolved_config(
-        forward_env=["ENV_TOKEN"],
-        workspace_startup_timeout=240,
-    )
-
-
-def test_config_resolver_uses_yaml_over_defaults_when_environment_absent(monkeypatch):
-    from hermes_plugin_coder.plugin import resolve_coder_config
-
-    for name in (
-        *_REQUIRED_ENV,
-        "TERMINAL_CODER_FORWARD_ENV",
-        "TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT",
-    ):
+    for name in _OPTIONAL_ENV:
         monkeypatch.delenv(name, raising=False)
 
-    assert resolve_coder_config(
-        {
-            "base_url": "https://yaml.example",
-            "api_key": "yaml-token",
-            "workspace_name": "yaml-workspace",
-            "forward_env": ["YAML_TOKEN"],
-            "workspace_startup_timeout": 500,
-        }
-    ) == {
-        "base_url": "https://yaml.example",
-        "api_key": "yaml-token",
-        "workspace_name": "yaml-workspace",
-        "forward_env": ["YAML_TOKEN"],
-        "workspace_startup_timeout": 500,
-    }
-
-
-def test_config_resolver_supplies_runtime_defaults(monkeypatch):
-    from hermes_plugin_coder.plugin import resolve_coder_config
-
-    for name in (
-        *_REQUIRED_ENV,
-        "TERMINAL_CODER_FORWARD_ENV",
-        "TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT",
-    ):
-        monkeypatch.delenv(name, raising=False)
-
-    assert resolve_coder_config({}) == {
+    assert _load_coder_environment_config() == {
+        "base_url": "https://coder.example",
+        "api_key": "secret-token",
+        "workspace_name": "shared-dev",
         "forward_env": [],
         "workspace_startup_timeout": 180,
     }
 
 
-def test_config_resolver_preserves_explicit_empty_environment_override(monkeypatch):
-    from hermes_plugin_coder.plugin import resolve_coder_config
-
-    monkeypatch.setenv("CODER_URL", "")
-
-    assert resolve_coder_config({"base_url": "https://yaml.example"})["base_url"] == ""
-
-
-def test_config_resolver_rejects_invalid_environment_override(monkeypatch):
-    from hermes_plugin_coder.plugin import resolve_coder_config
-
-    monkeypatch.setenv("TERMINAL_CODER_FORWARD_ENV", "not-json")
-
-    with pytest.raises(ValueError, match="TERMINAL_CODER_FORWARD_ENV"):
-        resolve_coder_config({"forward_env": ["YAML_TOKEN"]})
-
-
-def test_factory_rejects_missing_required_backend_config():
-    from hermes_plugin_coder.plugin import CoderTerminalEnvironmentProvider
-
-    with pytest.raises(ValueError, match="api_key"):
-        CoderTerminalEnvironmentProvider().create_environment(
-            cwd="~",
-            timeout=60,
-            backend_config={
-                "base_url": "https://coder.example",
-                "workspace_name": "shared-dev",
-            },
-        )
-
-
-@pytest.mark.parametrize("name", ["base_url", "api_key", "workspace_name"])
-def test_factory_rejects_non_string_required_backend_config(name):
-    from hermes_plugin_coder.plugin import CoderTerminalEnvironmentProvider
-
-    config = _resolved_config()
-    config[name] = object()
-
-    with pytest.raises(ValueError, match=name):
-        CoderTerminalEnvironmentProvider().create_environment(
-            cwd="~", timeout=60, backend_config=config
-        )
-
-
-def test_factory_rejects_boolean_startup_timeout():
-    from hermes_plugin_coder.plugin import CoderTerminalEnvironmentProvider
-
-    with pytest.raises(ValueError, match="workspace_startup_timeout"):
-        CoderTerminalEnvironmentProvider().create_environment(
-            cwd="~",
-            timeout=60,
-            backend_config=_resolved_config(workspace_startup_timeout=True),
-        )
-
-
-def test_current_host_runtime_resolves_profile_config_and_calls_provider_factory(
+def test_upstream_host_runtime_calls_provider_factory_without_config_payload(
     monkeypatch,
 ):
     from agent.terminal_env_registry import (
@@ -390,40 +223,18 @@ def test_current_host_runtime_resolves_profile_config_and_calls_provider_factory
         restore_registration,
         snapshot_registration,
     )
-    from hermes_cli import config as config_module
-    from tools import terminal_tool
+    from tools import terminal_tool_backends
 
     from hermes_plugin_coder import plugin
 
-    for name in (
-        *_REQUIRED_ENV,
-        "TERMINAL_CODER_FORWARD_ENV",
-        "TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("CODER_API_KEY", "secret-token")
-    monkeypatch.setattr(
-        config_module,
-        "read_user_config_raw",
-        lambda **_kwargs: {
-            "terminal": {
-                "backends": {
-                    "coder": {
-                        "base_url": "https://coder.example",
-                        "workspace_name": "shared-dev",
-                        "workspace_startup_timeout": 240,
-                    }
-                }
-            }
-        },
-    )
+    _set_required_env(monkeypatch)
     constructor = MagicMock(return_value=MagicMock())
     monkeypatch.setattr(plugin, "CoderEnvironment", constructor)
     provider = plugin.CoderTerminalEnvironmentProvider()
     previous = snapshot_registration(provider.name)
     register_provider(provider)
     try:
-        result = terminal_tool._create_environment(
+        result = terminal_tool_backends._create_environment(
             "coder", "", "/workspace", 45, task_id="task-coder"
         )
     finally:
@@ -438,5 +249,5 @@ def test_current_host_runtime_resolves_profile_config_and_calls_provider_factory
         cwd="/workspace",
         timeout=45,
         forward_env=[],
-        workspace_startup_timeout=240,
+        workspace_startup_timeout=180,
     )

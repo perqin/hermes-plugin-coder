@@ -40,11 +40,6 @@ def _invalid_config_fields(config: Mapping[str, Any]) -> list[str]:
     return invalid
 
 
-def coder_backend_config_available(config: Mapping[str, Any]) -> bool:
-    """Return whether resolved config can construct a Coder environment."""
-    return not _invalid_config_fields(config)
-
-
 def _parse_forward_env() -> list[str]:
     raw = os.getenv("TERMINAL_CODER_FORWARD_ENV", "[]")
     try:
@@ -75,29 +70,36 @@ def _parse_startup_timeout() -> int:
     return value
 
 
-def resolve_coder_config(
-    raw_backend_config: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Resolve Coder config with environment > profile YAML > defaults."""
+def _environment_config_and_invalid_fields() -> tuple[dict[str, Any], list[str]]:
+    """Load the upstream-compatible environment contract without leaking values."""
     config: dict[str, Any] = {
+        "base_url": os.getenv("CODER_URL"),
+        "api_key": os.getenv("CODER_API_KEY"),
+        "workspace_name": os.getenv("CODER_WORKSPACE"),
         "forward_env": [],
         "workspace_startup_timeout": 180,
     }
-    config.update(raw_backend_config)
-
-    for config_key, env_name in (
-        ("base_url", "CODER_URL"),
-        ("api_key", "CODER_API_KEY"),
-        ("workspace_name", "CODER_WORKSPACE"),
-    ):
-        value = os.getenv(env_name)
-        if value is not None:
-            config[config_key] = value
-
-    if os.getenv("TERMINAL_CODER_FORWARD_ENV") is not None:
+    parser_errors: list[str] = []
+    try:
         config["forward_env"] = _parse_forward_env()
-    if os.getenv("TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT") is not None:
+    except ValueError:
+        parser_errors.append("forward_env")
+    try:
         config["workspace_startup_timeout"] = _parse_startup_timeout()
+    except ValueError:
+        parser_errors.append("workspace_startup_timeout")
+
+    invalid = parser_errors + _invalid_config_fields(config)
+    return config, list(dict.fromkeys(invalid))
+
+
+def _load_coder_environment_config() -> dict[str, Any]:
+    """Load and validate Coder settings from the active process environment."""
+    config, invalid = _environment_config_and_invalid_fields()
+    if invalid:
+        raise ValueError(
+            "Coder environment config has invalid fields: " + ", ".join(invalid)
+        )
     return config
 
 
@@ -112,20 +114,10 @@ def create_coder_environment(
     cwd: str,
     timeout: int,
     task_id: str = "default",
-    backend_config: Mapping[str, Any] | None = None,
     **_kwargs: Any,
 ) -> CoderEnvironment:
-    """Build one Coder environment from host and resolved provider config."""
-    config = dict(backend_config or {})
-    invalid = _invalid_config_fields(config)
-    if invalid:
-        raise ValueError(
-            "Coder backend config has invalid fields: " + ", ".join(invalid)
-        )
-
-    forward_env = config.get("forward_env", [])
-    startup_timeout = config.get("workspace_startup_timeout", 180)
-
+    """Build one Coder environment from the upstream environment-only contract."""
+    config = _load_coder_environment_config()
     return CoderEnvironment(
         base_url=config["base_url"],
         task_id=task_id,
@@ -133,8 +125,8 @@ def create_coder_environment(
         workspace_name=config["workspace_name"],
         cwd=_remote_cwd(cwd),
         timeout=timeout,
-        forward_env=forward_env,
-        workspace_startup_timeout=startup_timeout,
+        forward_env=config["forward_env"],
+        workspace_startup_timeout=config["workspace_startup_timeout"],
     )
 
 
@@ -152,82 +144,33 @@ class CoderTerminalEnvironmentProvider(TerminalEnvironmentProvider):
     cache_path_base = "~/.hermes"
     strip_env_keys = frozenset({"CODER_API_KEY"})
 
-    def get_config_schema(self) -> dict[str, dict[str, Any]]:
-        return {
-            "base_url": {
-                "type": "string",
-                "description": "Coder deployment URL",
-                "env": "CODER_URL",
-                "required": True,
-            },
-            "api_key": {
-                "type": "secret",
-                "description": "Coder API key",
-                "env": "CODER_API_KEY",
-                "required": True,
-            },
-            "workspace_name": {
-                "type": "string",
-                "description": "Coder workspace name",
-                "env": "CODER_WORKSPACE",
-                "required": True,
-            },
-            "forward_env": {
-                "type": "list",
-                "description": "Environment variables forwarded to the workspace",
-                "env": "TERMINAL_CODER_FORWARD_ENV",
-                "default": [],
-            },
-            "workspace_startup_timeout": {
-                "type": "number",
-                "description": "Workspace startup timeout in seconds",
-                "env": "TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT",
-                "default": 180,
-            },
-        }
-
-    def resolve_config(self, config: Mapping[str, Any]) -> dict[str, Any]:
-        return resolve_coder_config(config)
-
     def is_available(self) -> bool:
-        try:
-            return coder_backend_config_available(self.validated_config({}))
-        except Exception:  # noqa: BLE001 - availability must fail soft
-            return False
+        _, invalid = _environment_config_and_invalid_fields()
+        return not invalid
 
-    def check_requirements(self, config: dict[str, Any]) -> bool:
-        backend_config = config.get("backend_config")
-        if not isinstance(backend_config, Mapping):
-            logger.error("Coder backend configuration was not resolved")
-            return False
-        invalid = _invalid_config_fields(backend_config)
+    def check_requirements(self, _config: dict[str, Any]) -> bool:
+        _, invalid = _environment_config_and_invalid_fields()
         if invalid:
             logger.error(
-                "Coder backend has invalid configuration fields: %s", ", ".join(invalid)
+                "Coder backend has invalid environment fields: %s",
+                ", ".join(invalid),
             )
             return False
         return True
 
     def probe(self) -> tuple[str, str]:
-        try:
-            return self.probe_with_config(self.validated_config({}))
-        except Exception:  # noqa: BLE001 - picker probes must not raise
-            return ("needs_setup", "Coder configuration is invalid.")
-
-    def probe_with_config(self, config: Mapping[str, Any]) -> tuple[str, str]:
-        invalid = _invalid_config_fields(config)
+        _, invalid = _environment_config_and_invalid_fields()
         if invalid:
-            return ("needs_setup", f"Configure Coder fields: {', '.join(invalid)}.")
+            return (
+                "needs_setup",
+                f"Configure Coder environment variables: {', '.join(invalid)}.",
+            )
         return ("ready", "")
 
     def setup_instructions(self) -> list[str]:
-        api_key_instruction = (
-            "Set CODER_API_KEY in the active profile environment or enter it "
-            + "in the secret field."
-        )
         return [
-            "Configure terminal.backends.coder.base_url and workspace_name.",
-            api_key_instruction,
+            "Set CODER_URL, CODER_API_KEY, and CODER_WORKSPACE in the active profile environment.",
+            "Optionally set TERMINAL_CODER_FORWARD_ENV and TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT.",
         ]
 
     def create_environment(
@@ -238,7 +181,6 @@ class CoderTerminalEnvironmentProvider(TerminalEnvironmentProvider):
         task_id: str = "default",
         image: str | None = None,
         container_config: dict[str, Any] | None = None,
-        backend_config: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> CoderEnvironment:
         return create_coder_environment(
@@ -247,7 +189,6 @@ class CoderTerminalEnvironmentProvider(TerminalEnvironmentProvider):
             task_id=task_id,
             image=image,
             container_config=container_config,
-            backend_config=backend_config,
             **kwargs,
         )
 
