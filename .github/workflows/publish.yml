@@ -101,7 +101,7 @@ jobs:
             "sha: $PLUGIN_SHA" \
             "version: \"$VERSION\"" \
             'description: Run Hermes terminal commands in an existing remote Coder workspace.' \
-            'maintainer: Perqin' \
+            'maintainer: perqin' \
             'tier: community' \
             'category: platform' \
             'docs_url: https://github.com/perqin/hermes-plugin-coder#readme' \
