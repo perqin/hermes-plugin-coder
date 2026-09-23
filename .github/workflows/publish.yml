@@ -103,7 +103,7 @@ jobs:
             'description: Run Hermes terminal commands in an existing remote Coder workspace.' \
             'maintainer: perqin' \
             'tier: community' \
-            'category: platform' \
+            'category: general' \
             'docs_url: https://github.com/perqin/hermes-plugin-coder#readme' \
             'platforms: []' \
             'capabilities:' \
