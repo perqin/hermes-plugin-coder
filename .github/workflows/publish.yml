@@ -16,38 +16,18 @@ jobs:
       contents: write
     steps:
       - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; nothing to do."
-          else
-            gh release create "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
-              --generate-notes \
-              --title "$TAG"
-          fi
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          name: ${{ github.ref_name }}
 
   publish-catalog:
     name: Publish plugin catalog entry
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - name: Check catalog PAT
-        env:
-          PLUGIN_CATALOG_PAT: ${{ secrets.PLUGIN_CATALOG_PAT }}
-        run: |
-          set -euo pipefail
-          if [ -z "$PLUGIN_CATALOG_PAT" ]; then
-            echo "::error::Configure the PLUGIN_CATALOG_PAT repository secret."
-            exit 1
-          fi
-
       - name: Check out released plugin
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           path: plugin
@@ -73,7 +53,7 @@ jobs:
           echo "branch=feat/publish-plugin-coder-$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Check out Hermes Agent fork
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@v6
         with:
           repository: perqin/hermes-agent
           ref: main
@@ -88,7 +68,7 @@ jobs:
         run: |
           set -euo pipefail
           git config user.name perqin
-          git config user.email perqin@moego.pet
+          git config user.email perqinxie@gmail.com
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
           git fetch upstream main
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
