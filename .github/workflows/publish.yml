@@ -1,0 +1,168 @@
+name: publish
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          name: ${{ github.ref_name }}
+
+  publish-catalog:
+    name: Publish plugin catalog entry
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out released plugin
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          path: plugin
+
+      - name: Resolve release metadata
+        id: release
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag must match v1.2.3; got $TAG"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          PLUGIN_SHA="$(git -C plugin rev-list -n 1 "$TAG")"
+          if [[ ! "$PLUGIN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve $TAG to a full commit SHA."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "plugin_sha=$PLUGIN_SHA" >> "$GITHUB_OUTPUT"
+          echo "branch=feat/publish-plugin-coder-$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check out Hermes Agent fork
+        uses: actions/checkout@v6
+        with:
+          repository: perqin/hermes-agent
+          ref: main
+          fetch-depth: 0
+          path: hermes-agent
+          token: ${{ secrets.PLUGIN_CATALOG_PAT }}
+
+      - name: Create or resume catalog branch
+        env:
+          BRANCH: ${{ steps.release.outputs.branch }}
+        working-directory: hermes-agent
+        run: |
+          set -euo pipefail
+          git config user.name perqin
+          git config user.email perqinxie@gmail.com
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH:refs/remotes/origin/$BRANCH"
+            git switch --create "$BRANCH" --track "origin/$BRANCH"
+            UNEXPECTED_FILES="$(git diff --name-only upstream/main...HEAD | grep -v '^plugin-catalog/coder\.yaml$' || true)"
+            if [ -n "$UNEXPECTED_FILES" ]; then
+              echo "::error::Existing branch contains unexpected changes:"
+              echo "$UNEXPECTED_FILES"
+              exit 1
+            fi
+            git merge --no-edit upstream/main
+          else
+            git switch --create "$BRANCH" upstream/main
+          fi
+
+      - name: Add or update coder catalog entry
+        env:
+          PLUGIN_SHA: ${{ steps.release.outputs.plugin_sha }}
+          VERSION: ${{ steps.release.outputs.version }}
+        working-directory: hermes-agent
+        run: |
+          set -euo pipefail
+          ENTRY='plugin-catalog/coder.yaml'
+          TEMP_ENTRY="$(mktemp plugin-catalog/.coder.yaml.XXXXXX)"
+          trap 'rm -f "$TEMP_ENTRY"' EXIT
+          printf '%s\n' \
+            'name: coder' \
+            'repo: https://github.com/perqin/hermes-plugin-coder' \
+            "sha: $PLUGIN_SHA" \
+            "version: \"$VERSION\"" \
+            'description: Run Hermes terminal commands in an existing remote Coder workspace.' \
+            'maintainer: perqin' \
+            'tier: community' \
+            'category: general' \
+            'docs_url: https://github.com/perqin/hermes-plugin-coder#readme' \
+            'platforms: []' \
+            'capabilities:' \
+            '  provides_tools: []' \
+            '  provides_hooks: []' \
+            '  provides_middleware: []' \
+            '  requires_env:' \
+            '    - CODER_URL' \
+            '    - CODER_API_KEY' \
+            '    - CODER_WORKSPACE' \
+            > "$TEMP_ENTRY"
+          chmod 0644 "$TEMP_ENTRY"
+          mv -f "$TEMP_ENTRY" "$ENTRY"
+          trap - EXIT
+
+      - name: Commit and push catalog branch
+        env:
+          BRANCH: ${{ steps.release.outputs.branch }}
+        working-directory: hermes-agent
+        run: |
+          set -euo pipefail
+          git add plugin-catalog/coder.yaml
+          read -r ENTRY_MODE _ < <(git ls-files --stage -- plugin-catalog/coder.yaml)
+          if [ "$ENTRY_MODE" != '100644' ]; then
+            echo "::error::plugin-catalog/coder.yaml must be a regular non-executable file."
+            exit 1
+          fi
+          if ! git diff --cached --quiet; then
+            git commit -m "feat(plugin-catalog): publish coder ${{ steps.release.outputs.version }}"
+          fi
+          CHANGED_FILES="$(git diff --name-only upstream/main...HEAD)"
+          if [ -n "$CHANGED_FILES" ] && [ "$CHANGED_FILES" != 'plugin-catalog/coder.yaml' ]; then
+            echo "::error::Catalog branch must change only plugin-catalog/coder.yaml; got:"
+            echo "$CHANGED_FILES"
+            exit 1
+          fi
+          git push --set-upstream origin "$BRANCH"
+
+      - name: Open upstream pull request
+        env:
+          GH_TOKEN: ${{ secrets.PLUGIN_CATALOG_PAT }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+          PLUGIN_SHA: ${{ steps.release.outputs.plugin_sha }}
+          VERSION: ${{ steps.release.outputs.version }}
+        working-directory: hermes-agent
+        run: |
+          set -euo pipefail
+          EXISTING_PR="$(gh api \
+            "repos/NousResearch/hermes-agent/pulls?state=open&head=perqin:$BRANCH" \
+            --jq '.[0].html_url // empty')"
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Pull request already exists: $EXISTING_PR"
+          elif git diff --quiet upstream/main...HEAD; then
+            echo "Catalog entry is already current on upstream/main; no pull request needed."
+          else
+            gh pr create \
+              --repo NousResearch/hermes-agent \
+              --base main \
+              --head "perqin:$BRANCH" \
+              --title "feat(plugin-catalog): publish coder $VERSION" \
+              --body "Publishes coder $VERSION from https://github.com/perqin/hermes-plugin-coder at commit \`$PLUGIN_SHA\`."
+          fi
