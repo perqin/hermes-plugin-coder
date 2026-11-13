@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from collections.abc import Mapping
 from typing import Any
 
+from agent.secret_scope import get_secret
 from agent.terminal_env_provider import TerminalEnvironmentProvider
+from tools.terminal_scope import terminal_env
 
 from .backend import (
     CoderEnvironment,
@@ -41,7 +42,7 @@ def _invalid_config_fields(config: Mapping[str, Any]) -> list[str]:
 
 
 def _parse_forward_env() -> list[str]:
-    raw = os.getenv("TERMINAL_CODER_FORWARD_ENV", "[]")
+    raw = terminal_env("TERMINAL_CODER_FORWARD_ENV", "[]")
     try:
         parsed: Any = json.loads(raw)
     except (TypeError, json.JSONDecodeError) as exc:
@@ -56,7 +57,7 @@ def _parse_forward_env() -> list[str]:
 
 
 def _parse_startup_timeout() -> int:
-    raw = os.getenv("TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT", "180")
+    raw = terminal_env("TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT", "180")
     try:
         value = int(raw)
     except (TypeError, ValueError) as exc:
@@ -71,11 +72,11 @@ def _parse_startup_timeout() -> int:
 
 
 def _environment_config_and_invalid_fields() -> tuple[dict[str, Any], list[str]]:
-    """Load the upstream-compatible environment contract without leaking values."""
+    """Read the active profile scope, which may differ from the process env."""
     config: dict[str, Any] = {
-        "base_url": os.getenv("CODER_URL"),
-        "api_key": os.getenv("CODER_API_KEY"),
-        "workspace_name": os.getenv("CODER_WORKSPACE"),
+        "base_url": get_secret("CODER_URL"),
+        "api_key": get_secret("CODER_API_KEY"),
+        "workspace_name": get_secret("CODER_WORKSPACE"),
         "forward_env": [],
         "workspace_startup_timeout": 180,
     }
@@ -94,7 +95,7 @@ def _environment_config_and_invalid_fields() -> tuple[dict[str, Any], list[str]]
 
 
 def _load_coder_environment_config() -> dict[str, Any]:
-    """Load and validate Coder settings from the active process environment."""
+    """Load and validate Coder settings from the active profile environment."""
     config, invalid = _environment_config_and_invalid_fields()
     if invalid:
         raise ValueError(

@@ -25,6 +25,7 @@ import uuid
 from collections.abc import Callable, Iterable
 
 import requests
+from agent.secret_scope import get_secret
 from tools.environments import BaseEnvironment
 from websockets.exceptions import ConnectionClosed, WebSocketException
 from websockets.sync.client import ClientConnection, connect
@@ -69,11 +70,11 @@ def _normalize_forward_env_names(forward_env: Iterable[object] | None) -> list[s
 
 
 def _collect_forwarded_env_values(forward_env: list[str]) -> dict[str, str]:
-    """Resolve only explicitly configured names from the active process env."""
+    """Resolve explicitly approved names within the active profile scope."""
     names = _normalize_forward_env_names(forward_env)
     resolved: dict[str, str] = {}
     for name in names:
-        value = os.getenv(name)
+        value = get_secret(name)
         if value:
             resolved[name] = value
     return resolved

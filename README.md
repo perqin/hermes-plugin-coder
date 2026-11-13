@@ -5,7 +5,7 @@ Third-party [Coder](https://coder.com/) terminal environment provider for Hermes
 ## Requirements
 
 - A Coder deployment reachable over HTTPS and an existing workspace.
-- Hermes Agent with the terminal-backend plugin contract.
+- Hermes Agent with the terminal-backend plugin contract and `agent.secret_scope.get_secret`.
 - Python dependencies declared in `pyproject.toml`.
 
 ## Configuration
@@ -21,6 +21,8 @@ TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT=180
 ```
 
 The first three variables are required. `TERMINAL_CODER_FORWARD_ENV` defaults to `[]`, and `TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT` defaults to `180`. Invalid or explicitly empty values fail closed.
+
+Connection settings and forwarded variable values are resolved through Hermes's `get_secret()` API; the two `TERMINAL_CODER_*` options use its `terminal_env()` API. Both honor the active profile's environment (including its `.env`). This supports Desktop and multiplexed profiles without copying their credentials into the shared process environment. In single-profile mode, Hermes also supports process environment values.
 
 Profile YAML under `terminal.backends.coder`, Dashboard/Desktop configuration fields, and config-aware probing are temporarily unavailable until upstream Hermes gains the provider-owned configuration contract. The API key remains stripped from model-authored subprocesses and is never included in probe details.
 
